@@ -704,6 +704,20 @@ fn execute_command(
         ["HARDWARE", "GET"] => Ok(encode_memory_hardware(
             MEMORY_HARDWARE.get_or_init(read_privileged_memory_hardware),
         )),
+        ["FAN", "RPM"] => {
+            let channels = hardware.fan_rpm_channels();
+
+            let rpm = |index: u8| {
+                channels
+                    .iter()
+                    .find(|channel| channel.index == index)
+                    .and_then(|channel| channel.rpm)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            };
+
+            Ok(format!("cpu={} gpu={}", rpm(1), rpm(2)))
+        }
         ["FAN", "AUTO"] => {
             hardware
                 .apply_fan_setting(FanSetting::Automatic)

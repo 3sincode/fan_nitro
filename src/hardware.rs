@@ -19,6 +19,11 @@ const EXPECTED_VENDOR: &str = "Acer";
 const REFERENCE_PRODUCT: &str = "Predator PHN16-72";
 const GAMING_WMI_GUID: &str = "7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56";
 const PWM_MAX: u32 = 255;
+const ANV15_51_PRODUCT: &str = "Nitro ANV15-51";
+const ACPI_CALL_PATH: &str = "proc/acpi/call";
+const ANV15_51_CPU_FAN_OBJECT: &str = "\\_SB.PC00.LPCB.EC0.CPUF";
+const ANV15_51_GPU_FAN_OBJECT: &str = "\\_SB.PC00.LPCB.EC0.GPUF";
+const ANV15_51_MAX_REASONABLE_RPM: u32 = 12_000;
 
 #[derive(Debug)]
 pub enum HardwareError {
@@ -591,41 +596,116 @@ impl AcerHardware {
     }
 
     pub fn fan_rpm_channels(&self) -> Vec<FanRpmChannel> {
-        let Some(hwmon) = &self.hwmon else {
-            return Vec::new();
-        };
-        (1_u8..=8)
-            .filter_map(|index| {
-                let rpm_path = hwmon.join(format!("fan{index}_input"));
-                if !rpm_path.is_file() {
-                    return None;
-                }
-                let label_path = hwmon.join(format!("fan{index}_label"));
-                let label = fs::read_to_string(label_path)
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| match index {
-                        1 => "CPU".to_string(),
-                        2 => "GPU".to_string(),
-                        _ => format!("Fan {index}"),
-                    });
-                Some(FanRpmChannel {
+        if let Some(hwmon) = &self.hwmon {
+            let channels: Vec<_> = (1_u8..=8)
+                .filter_map(|index| {
+                    let rpm_path = hwmon.join(format!("fan{index}_input"));
+                    if !rpm_path.is_file() {
+                        return None;
+                    }
+
+                    let label_path = hwmon.join(format!("fan{index}_label"));
+                    let label = fs::read_to_string(label_path)
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| match index {
+                            1 => "CPU".to_string(),
+                            2 => "GPU".to_string(),
+                            _ => format!("Fan {index}"),
+                        });
+
+                    Some(FanRpmChannel {
+                        index,
+                        label,
+                        rpm: self.read_rpm(index).ok(),
+                    })
+                })
+                .collect();
+
+            if !channels.is_empty() {
+                return channels;
+            }
+        }
+
+        let acpi_call = rooted(&self.root, ACPI_CALL_PATH);
+
+        if self.platform.product == ANV15_51_PRODUCT && acpi_call.is_file() {
+            return [(1_u8, "CPU"), (2_u8, "GPU")]
+                .into_iter()
+                .map(|(index, label)| FanRpmChannel {
                     index,
-                    label,
+                    label: label.to_string(),
                     rpm: self.read_rpm(index).ok(),
                 })
-            })
-            .collect()
+                .collect();
+        }
+
+        Vec::new()
     }
 
     fn read_rpm(&self, channel: u8) -> Result<u32, HardwareError> {
-        let path = self
-            .hwmon
-            .as_ref()
-            .ok_or(HardwareError::AcerHwmonNotFound)?
-            .join(format!("fan{channel}_input"));
-        parse_value(&path, "fan RPM")
+        if let Some(hwmon) = &self.hwmon {
+            let path = hwmon.join(format!("fan{channel}_input"));
+
+            if path.is_file() {
+                return parse_value(&path, "fan RPM");
+            }
+        }
+
+        if self.platform.product == ANV15_51_PRODUCT {
+            return self.read_anv15_51_rpm(channel);
+        }
+
+        Err(HardwareError::AcerHwmonNotFound)
+    }
+
+    fn read_anv15_51_rpm(&self, channel: u8) -> Result<u32, HardwareError> {
+        let object = match channel {
+            1 => ANV15_51_CPU_FAN_OBJECT,
+            2 => ANV15_51_GPU_FAN_OBJECT,
+            value => {
+                return Err(HardwareError::InvalidValue {
+                    field: "ANV15-51 fan channel",
+                    value: value.to_string(),
+                });
+            }
+        };
+
+        let path = rooted(&self.root, ACPI_CALL_PATH);
+
+        fs::write(&path, format!("{object}\n")).map_err(|source| HardwareError::Io {
+            operation: "query ANV15-51 fan RPM",
+            path: path.clone(),
+            source,
+        })?;
+
+        let value = read_trimmed(&path, "read ANV15-51 fan RPM")?;
+        let clean_value = value.trim_end_matches('\0').trim();
+
+        let hex = clean_value
+            .strip_prefix("0x")
+            .or_else(|| clean_value.strip_prefix("0X"))
+            .ok_or_else(|| HardwareError::InvalidValue {
+                field: "ANV15-51 fan RPM",
+                value: value.clone(),
+            })?;
+
+        let raw = u16::from_str_radix(hex, 16).map_err(|_| HardwareError::InvalidValue {
+            field: "ANV15-51 fan RPM",
+            value: value.clone(),
+        })?;
+
+        let rpm = u32::from(raw.swap_bytes());
+
+        if rpm > ANV15_51_MAX_REASONABLE_RPM {
+            return Err(HardwareError::InvalidValue {
+                field: "ANV15-51 fan RPM",
+                value: rpm.to_string(),
+            });
+        }
+
+        Ok(rpm)
     }
 
     fn set_both_modes(&self, mode: FanMode) -> Result<(), HardwareError> {

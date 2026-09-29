@@ -228,6 +228,41 @@ impl ControlClient {
         self.request("FAN MAXIMUM").map(|_| ())
     }
 
+    pub fn fan_rpm(&mut self) -> ControlResult<(Option<u32>, Option<u32>)> {
+        let response = self.request("FAN RPM")?;
+
+        let parse = |value: &str| -> ControlResult<Option<u32>> {
+            if value == "-" {
+                return Ok(None);
+            }
+
+            let rpm = value
+                .parse::<u32>()
+                .map_err(|_| ControlError::Protocol(format!("invalid fan RPM value: {value:?}")))?;
+
+            if rpm > 20_000 {
+                return Err(ControlError::Protocol(format!(
+                    "fan RPM value is out of range: {rpm}"
+                )));
+            }
+
+            Ok(Some(rpm))
+        };
+
+        let mut cpu = None;
+        let mut gpu = None;
+
+        for field in response.split_ascii_whitespace() {
+            if let Some(value) = field.strip_prefix("cpu=") {
+                cpu = parse(value)?;
+            } else if let Some(value) = field.strip_prefix("gpu=") {
+                gpu = parse(value)?;
+            }
+        }
+
+        Ok((cpu, gpu))
+    }
+
     pub fn fan_manual(&mut self, cpu_percent: u8, gpu_percent: u8) -> ControlResult<()> {
         if !(20..=100).contains(&cpu_percent) || !(20..=100).contains(&gpu_percent) {
             return Err(ControlError::InvalidRequest(

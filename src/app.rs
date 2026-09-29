@@ -845,6 +845,7 @@ enum PlatformAction {
 enum ControlAction {
     Initialize,
     FanMode(FanMode),
+    FanRpm,
     ManualFans(ManualFanRequest),
     Profile(String),
     LightingApply(LightingApplyRequest),
@@ -861,7 +862,7 @@ impl ControlAction {
     fn error_kind(&self) -> UiErrorKind {
         match self {
             Self::Initialize => UiErrorKind::Initialization,
-            Self::FanMode(_) | Self::ManualFans(_) => UiErrorKind::Fan,
+            Self::FanMode(_) | Self::FanRpm | Self::ManualFans(_) => UiErrorKind::Fan,
             Self::Profile(_) => UiErrorKind::Profile,
             Self::LightingApply(_) | Self::LightingPower(_) => UiErrorKind::Lighting,
             Self::Platform(_) => UiErrorKind::Platform,
@@ -905,6 +906,10 @@ enum ControlOutcome {
         platform: Result<PlatformState, String>,
     },
     FanMode(FanMode),
+    FanRpm {
+        cpu: Option<u32>,
+        gpu: Option<u32>,
+    },
     ManualFans(ManualFanRequest),
     Profile {
         profile_raw: String,
@@ -1109,6 +1114,9 @@ fn Root() -> Element {
                         state.view.telemetry_health = TelemetryHealth::Online;
                         state.view.telemetry_error = None;
                         drop(state);
+
+                        let _ = resume_control_worker
+                            .submit(ControlRequest::background(ControlAction::FanRpm));
                         if refresh_capabilities {
                             pending_refresh.store(true, Ordering::Release);
                         }
@@ -1470,6 +1478,8 @@ fn execute_control_action_inner(
                 initialize_control(control)
             }
         },
+        ControlAction::FanRpm => with_control(control, |client| client.fan_rpm())
+            .map(|(cpu, gpu)| ControlOutcome::FanRpm { cpu, gpu }),
         ControlAction::FanMode(mode) => with_control(control, |client| match mode {
             FanMode::Auto => client.fan_auto(),
             FanMode::Manual => Err(ControlError::InvalidRequest(
@@ -1636,9 +1646,13 @@ fn fail_control_request(view: &mut AppState, request: ControlRequest, error: Str
 }
 
 fn apply_control_update(view: &mut AppState, update: ControlUpdate) {
-    view.control_busy = false;
-    if update.request.action.touches_platform() {
-        view.platform_busy = false;
+    let rpm_poll = update.request.action == ControlAction::FanRpm;
+
+    if !rpm_poll {
+        view.control_busy = false;
+        if update.request.action.touches_platform() {
+            view.platform_busy = false;
+        }
     }
 
     let outcome = match update.result {
@@ -1717,6 +1731,10 @@ fn apply_control_update(view: &mut AppState, update: ControlUpdate) {
         ControlOutcome::FanMode(mode) => {
             view.fan_mode = mode;
             finish_control_success(view, UiStatus::SettingsConfirmed);
+        }
+        ControlOutcome::FanRpm { cpu, gpu } => {
+            view.telemetry.cpu_fan_rpm = cpu;
+            view.telemetry.gpu_fan_rpm = gpu;
         }
         ControlOutcome::ManualFans(request) => {
             view.fan_mode = FanMode::Manual;
@@ -2063,12 +2081,12 @@ fn apply_telemetry(view: &mut AppState, sample: SystemTelemetry) {
         cpu_load_percent: sample.cpu_utilization_percent,
         memory_used_mib: Some(sample.memory_used_mib),
         memory_total_mib: Some(sample.memory_total_mib),
-        cpu_fan_rpm: primary_fan_rpm(1),
+        cpu_fan_rpm: primary_fan_rpm(1).or(view.telemetry.cpu_fan_rpm),
         cpu_fan_max_rpm: 8_000,
         gpu_temperature_c: sample.gpu.temperature_c,
         gpu_sleeping: sample.gpu.sleeping,
         gpu_load_percent: sample.gpu.utilization_percent,
-        gpu_fan_rpm: primary_fan_rpm(2),
+        gpu_fan_rpm: primary_fan_rpm(2).or(view.telemetry.gpu_fan_rpm),
         gpu_fan_max_rpm: 7_000,
         gpu_aux_fan_rpm,
         additional_fans,
